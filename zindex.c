@@ -10,7 +10,6 @@
 #include <zstd.h>
 #include <pthread.h>
 #include <fnmatch.h>
-#include <assert.h>
 
 /*
    Compile (tested on ubuntu)
@@ -139,6 +138,7 @@ static void index_tar_entries(ZSTD_DCtx *dctx, const void *base, size_t size, of
             if (is_end_of_archive(tar_data)) {
                 size_t rem = tar_data_size - TAR_BLOCK_SIZE;
                 memmove(tar_data, tar_data + TAR_BLOCK_SIZE, rem);
+                tar_data_size = rem;
                 goto done;
             }
 
@@ -338,10 +338,9 @@ int main(int argc, char **argv) {
     snippet_index idx;
     snippet_index_init(&idx);
 
-    assert(file_count > 0);
     int thread_count = (int)(file_count > MAX_THREADS ? MAX_THREADS : file_count);
-    pthread_t threads[MAX_THREADS];
-    thread_arg targs[MAX_THREADS];
+    pthread_t threads[thread_count];
+    thread_arg targs[thread_count];
 
     int files_per_thread = (int)(file_count / thread_count);
     int remainder = (int)(file_count % thread_count);
