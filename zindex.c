@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <zstd.h>
 #include <pthread.h>
+#include <fnmatch.h>
 
 /*
    Compile (tested on ubuntu)
