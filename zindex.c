@@ -10,7 +10,6 @@
 #include <zstd.h>
 #include <pthread.h>
 #include <fnmatch.h>
-#include <assert.h>
 
 /*
    Compile (tested on ubuntu)
@@ -337,11 +336,14 @@ int main(int argc, char **argv) {
 
     snippet_index idx;
     snippet_index_init(&idx);
-
-    assert(file_count > 0);
-    int thread_count = (int)(file_count > MAX_THREADS ? MAX_THREADS : file_count);
-    pthread_t threads[MAX_THREADS];
-    thread_arg targs[MAX_THREADS];
+    if (file_count == 0) {
+        fprintf(stderr, "No files found.\n");
+        return 1;
+    }
+   
+    int thread_count = (file_count > MAX_THREADS) ? MAX_THREADS : file_count;
+    pthread_t threads[thread_count];
+    thread_arg targs[thread_count];
 
     int files_per_thread = (int)(file_count / thread_count);
     int remainder = (int)(file_count % thread_count);
