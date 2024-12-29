@@ -8,63 +8,81 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
-#define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
 
-#define AC_ALPHABET_SIZE 256
-#define MAX_THREADS 12
-#define ZSTD_CHUNK_SIZE (128 * 1024)  // Decompress in smallish blocks
-#define ROLLING_BUF_SIZE (256 * 1024) // Rolling buffer for partial matches
-#define FRAME_MAGIC 0xFD2FB528U
-#define TAR_BLOCK_SIZE 512
+#include "cJSON.h" // The cJSON library header
+
+// For limiting chunk memory usage, etc.
+#define MAX_CHUNK_UNCOMPRESSED (64ULL * 1024ULL * 1024ULL) // e.g. 64MB max
+#define ROLLING_BUF_SIZE (64 * 1024)                       // Use a bigger ring buffer if you want
 #define MAX_FILENAME_LEN 512
+#define MAX_PREVIEW_LEN 1024
+#define MAX_QUEUE_SIZE 20000
 
-// For single-pattern Aho–Corasick:
-static size_t g_patternLen = 0; // set after building the Aho automaton
+#define MAX_THREADS 8 // or 12, however many you want
 
-// -------------------------------------
-// 1) SearchResult + PrintQueue
-// -------------------------------------
-typedef struct {
+// -----------------------------------------------------------------------------
+//  Data structures from your existing code
+// -----------------------------------------------------------------------------
+
+// chunk-based index structures
+typedef struct
+{
+    int chunk_id;
+    long long compressed_offset;
+    long long compressed_size;
+    long long uncompressed_start;
+    long long uncompressed_end;
+} ChunkInfo;
+
+typedef struct
+{
+    ChunkInfo *chunks;
+    size_t count;
+} IndexInfo;
+
+// For your ring buffer approach
+typedef struct
+{
     char filename[MAX_FILENAME_LEN];
     off_t offset;
     int closenessScore;
-    char preview[256];
+    char preview[2048];
 } SearchResult;
 
-// A singly-linked node for the queue
-typedef struct PrintNode {
+// PrintQueue for multi-threaded result printing
+typedef struct PrintNode
+{
     SearchResult item;
     struct PrintNode *next;
 } PrintNode;
 
-// The queue itself
-typedef struct {
+typedef struct
+{
     PrintNode *head;
     PrintNode *tail;
     size_t size;
-    bool done;               // signals all workers are done
+    bool done;
     pthread_mutex_t lock;
     pthread_cond_t cond;
 } PrintQueue;
 
-// Initialize the queue
-static void printqueue_init(PrintQueue *q) {
+static void printqueue_init(PrintQueue *q)
+{
     q->head = q->tail = NULL;
     q->size = 0;
     q->done = false;
     pthread_mutex_init(&q->lock, NULL);
     pthread_cond_init(&q->cond, NULL);
 }
-
-// Destroy the queue
-static void printqueue_destroy(PrintQueue *q) {
-    // Clear any leftover items
+static void printqueue_destroy(PrintQueue *q)
+{
     PrintNode *cur = q->head;
-    while (cur) {
+    while (cur)
+    {
         PrintNode *tmp = cur->next;
         free(cur);
         cur = tmp;
@@ -72,91 +90,324 @@ static void printqueue_destroy(PrintQueue *q) {
     pthread_mutex_destroy(&q->lock);
     pthread_cond_destroy(&q->cond);
 }
+static void printqueue_push(PrintQueue *q, const SearchResult *res)
+{
+    pthread_mutex_lock(&q->lock);
+    if (q->size >= MAX_QUEUE_SIZE)
+    {
+        pthread_mutex_unlock(&q->lock);
+        return;
+    }
+    pthread_mutex_unlock(&q->lock);
 
-// Enqueue a search result
-static void printqueue_push(PrintQueue *q, const SearchResult *res) {
-    PrintNode *node = (PrintNode*)malloc(sizeof(PrintNode));
-    if (!node) return; // ignoring oom
-
+    PrintNode *node = malloc(sizeof(*node));
+    if (!node)
+        return;
     node->item = *res;
     node->next = NULL;
 
     pthread_mutex_lock(&q->lock);
-    if (q->tail) {
+    if (q->tail)
+    {
         q->tail->next = node;
         q->tail = node;
-    } else {
-        // queue was empty
+    }
+    else
+    {
         q->head = q->tail = node;
     }
     q->size++;
-    // signal the printer thread
     pthread_cond_signal(&q->cond);
     pthread_mutex_unlock(&q->lock);
 }
-
-// Pop a search result (blocking)
-static bool printqueue_pop(PrintQueue *q, SearchResult *out) {
+static bool printqueue_pop(PrintQueue *q, SearchResult *out)
+{
     pthread_mutex_lock(&q->lock);
-    // Wait until queue has an item or done is true
-    while (q->size == 0 && !q->done) {
+    while (q->size == 0 && !q->done)
+    {
         pthread_cond_wait(&q->cond, &q->lock);
     }
-    if (q->size == 0 && q->done) {
-        // no items left, done
+    if (q->size == 0 && q->done)
+    {
         pthread_mutex_unlock(&q->lock);
         return false;
     }
-    // we have an item
     PrintNode *node = q->head;
     q->head = node->next;
-    if (!q->head) q->tail = NULL;
+    if (!q->head)
+        q->tail = NULL;
     q->size--;
     *out = node->item;
     free(node);
     pthread_mutex_unlock(&q->lock);
     return true;
 }
-
-// Mark the queue as done
-static void printqueue_mark_done(PrintQueue *q) {
+static void printqueue_mark_done(PrintQueue *q)
+{
     pthread_mutex_lock(&q->lock);
     q->done = true;
-    // wake up any waiting threads
     pthread_cond_broadcast(&q->cond);
     pthread_mutex_unlock(&q->lock);
 }
 
-// -------------------------------------
-// 2) Aho–Corasick
-// -------------------------------------
-typedef struct ACNode {
+// -----------------------------------------------------------------------------
+//  Aho-Corasick structures
+// -----------------------------------------------------------------------------
+#define AC_ALPHABET_SIZE 256
+
+typedef struct ACNode
+{
     struct ACNode *children[AC_ALPHABET_SIZE];
     struct ACNode *fail;
-    int output; 
-    int depth;  
+    int output;
+    int depth;
 } ACNode;
 
-// Create a new ACNode
-static ACNode *create_node(void) {
-    ACNode *node = (ACNode*)calloc(1, sizeof(ACNode));
-    if (node) {
-        node->fail = NULL;
-        node->output = 0;
-        node->depth = 0;
-    }
-    return node;
+typedef struct
+{
+    ACNode **nodes;
+    size_t count;
+    size_t capacity;
+    pthread_mutex_t lock;
+} NodeTracker;
+
+static NodeTracker g_tracker;
+static pthread_mutex_t g_pattern_mutex = PTHREAD_MUTEX_INITIALIZER;
+static size_t g_patternLen = 0;
+
+static void set_pattern_len(size_t len)
+{
+    pthread_mutex_lock(&g_pattern_mutex);
+    g_patternLen = len;
+    pthread_mutex_unlock(&g_pattern_mutex);
+}
+static size_t get_pattern_len(void)
+{
+    pthread_mutex_lock(&g_pattern_mutex);
+    size_t len = g_patternLen;
+    pthread_mutex_unlock(&g_pattern_mutex);
+    return len;
 }
 
-// Example closeness
-static int compute_closeness(const char *haystack, const char *needle) {
-    int best = 0, score = 0;
-    while (*haystack && *needle) {
-        if (tolower((unsigned char)*haystack) == tolower((unsigned char)*needle)) {
-            score++;
-            if (score > best) best = score;
-        } else {
-            score = 0;
+// ring buffer state
+typedef struct
+{
+    char buffer[ROLLING_BUF_SIZE];
+    size_t writePos;
+    off_t globalOffset;
+    ACNode *acState;
+    pthread_mutex_t lock;
+} RingBufState;
+
+static __thread RingBufState g_ring;
+
+// -----------------------------------------------------------------------------
+//  JSON Parsing for .idx.json
+// -----------------------------------------------------------------------------
+static IndexInfo *parse_index_json(const char *idx_filename)
+{
+    FILE *fp = fopen(idx_filename, "rb");
+    if (!fp)
+    {
+        fprintf(stderr, "Cannot open idx file: %s\n", idx_filename);
+        return NULL;
+    }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    char *buf = malloc(sz + 1);
+    if (!buf)
+    {
+        fclose(fp);
+        return NULL;
+    }
+    fread(buf, 1, sz, fp);
+    buf[sz] = '\0';
+    fclose(fp);
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root)
+    {
+        fprintf(stderr, "JSON parse error in %s\n", idx_filename);
+        free(buf);
+        return NULL;
+    }
+    cJSON *chunksArr = cJSON_GetObjectItem(root, "chunks");
+    if (!chunksArr || !cJSON_IsArray(chunksArr))
+    {
+        fprintf(stderr, "No 'chunks' array in %s\n", idx_filename);
+        cJSON_Delete(root);
+        free(buf);
+        return NULL;
+    }
+    int n = cJSON_GetArraySize(chunksArr);
+    IndexInfo *info = calloc(1, sizeof(*info));
+    info->count = n;
+    info->chunks = calloc(n, sizeof(ChunkInfo));
+    for (int i = 0; i < n; i++)
+    {
+        cJSON *elem = cJSON_GetArrayItem(chunksArr, i);
+        if (!elem)
+            continue;
+        ChunkInfo *C = &info->chunks[i];
+        C->chunk_id = cJSON_GetObjectItem(elem, "chunk_id")->valueint;
+        C->compressed_offset =
+            (long long)cJSON_GetObjectItem(elem, "compressed_offset")->valuedouble;
+        C->compressed_size =
+            (long long)cJSON_GetObjectItem(elem, "compressed_size")->valuedouble;
+        C->uncompressed_start =
+            (long long)cJSON_GetObjectItem(elem, "uncompressed_start")->valuedouble;
+        C->uncompressed_end =
+            (long long)cJSON_GetObjectItem(elem, "uncompressed_end")->valuedouble;
+    }
+    cJSON_Delete(root);
+    free(buf);
+    return info;
+}
+static void free_index_info(IndexInfo *info)
+{
+    if (!info)
+        return;
+    free(info->chunks);
+    free(info);
+}
+
+// -----------------------------------------------------------------------------
+//  Aho–Corasick creation
+// -----------------------------------------------------------------------------
+static void init_node_tracker(void)
+{
+    g_tracker.nodes = malloc(1024 * sizeof(ACNode *));
+    g_tracker.capacity = 1024;
+    g_tracker.count = 0;
+    pthread_mutex_init(&g_tracker.lock, NULL);
+}
+static ACNode *create_node(void)
+{
+    ACNode *node = calloc(1, sizeof(*node));
+    if (!node)
+        return NULL;
+
+    pthread_mutex_lock(&g_tracker.lock);
+    if (g_tracker.count >= g_tracker.capacity)
+    {
+        size_t newcap = g_tracker.capacity * 2;
+        ACNode **newarr = realloc(g_tracker.nodes, newcap * sizeof(ACNode *));
+        if (!newarr)
+        {
+            pthread_mutex_unlock(&g_tracker.lock);
+            free(node);
+            return NULL;
+        }
+        g_tracker.nodes = newarr;
+        g_tracker.capacity = newcap;
+    }
+    g_tracker.nodes[g_tracker.count++] = node;
+    pthread_mutex_unlock(&g_tracker.lock);
+    return node;
+}
+static void free_aho_automaton(ACNode *root)
+{
+    pthread_mutex_lock(&g_tracker.lock);
+    for (size_t i = 0; i < g_tracker.count; i++)
+    {
+        free(g_tracker.nodes[i]);
+    }
+    free(g_tracker.nodes);
+    g_tracker.nodes = NULL;
+    g_tracker.count = g_tracker.capacity = 0;
+    pthread_mutex_unlock(&g_tracker.lock);
+    pthread_mutex_destroy(&g_tracker.lock);
+}
+ACNode *build_aho_automaton(const char *pattern)
+{
+    set_pattern_len(strlen(pattern));
+    ACNode *root = create_node();
+    if (!root)
+        return NULL;
+
+    // Insert the pattern characters exactly once
+    ACNode *cur = root;
+    for (size_t i = 0; i < get_pattern_len(); i++)
+    {
+        unsigned char c = (unsigned char)tolower((unsigned char)pattern[i]);
+        if (!cur->children[c])
+        {
+            cur->children[c] = create_node();
+            if (!cur->children[c])
+                return root;
+            cur->children[c]->depth = cur->depth + 1;
+        }
+        cur = cur->children[c];
+    }
+    cur->output = 1;
+    // BFS for fail links
+    // Typically we do the classic approach:
+    ACNode **queue = malloc(MAX_QUEUE_SIZE * sizeof(ACNode *)); // or bigger
+    if (!queue)
+        return root;
+
+    int front = 0, back = 0;
+
+    // For c in [0..255], if child is null => set child to root
+    // otherwise set fail= root & enqueue
+    for (int c = 0; c < AC_ALPHABET_SIZE; c++)
+    {
+        if (root->children[c])
+        {
+            root->children[c]->fail = root;
+            queue[back++] = root->children[c];
+        }
+        else
+        {
+            // direct transition from root
+            root->children[c] = root;
+        }
+    }
+
+    // BFS
+    while (front < back)
+    {
+        ACNode *u = queue[front++];
+        for (int c = 0; c < AC_ALPHABET_SIZE; c++)
+        {
+            ACNode *v = u->children[c];
+            if (!v)
+            {
+                // set missing transition to fail->children[c]
+                u->children[c] = u->fail->children[c];
+            }
+            else
+            {
+                // set fail
+                ACNode *f = u->fail;
+                v->fail = f->children[c];
+                v->output |= v->fail->output;
+                queue[back++] = v;
+            }
+        }
+    }
+    free(queue);
+    return root;
+}
+
+// simple closeness measure
+static int compute_closeness(const char *haystack, const char *needle)
+{
+    // e.g. count consecutive matching letters from the start
+    int best = 0, curr = 0;
+    while (*haystack && *needle)
+    {
+        if (tolower(*haystack) == tolower(*needle))
+        {
+            curr++;
+            if (curr > best)
+                best = curr;
+        }
+        else
+        {
+            curr = 0;
         }
         haystack++;
         needle++;
@@ -164,629 +415,421 @@ static int compute_closeness(const char *haystack, const char *needle) {
     return best;
 }
 
-// Build Aho automaton for single pattern
-static ACNode *build_aho_automaton(const char *pattern) {
-    g_patternLen = strlen(pattern);
-
-    ACNode *root = create_node();
-    if (!root) return NULL;
-
-    // Insert pattern into trie
-    ACNode *cur = root;
-    for (size_t i = 0; i < g_patternLen; i++) {
-        unsigned char c = (unsigned char)tolower((unsigned char)pattern[i]);
-        if (!cur->children[c]) {
-            cur->children[c] = create_node();
-            if (!cur->children[c]) return root;
-            cur->children[c]->depth = cur->depth + 1;
-        }
-        cur = cur->children[c];
-    }
-    cur->output = 1;
-
-    // BFS to build fail links
-    root->fail = root;
-    size_t queueCap = 256;
-    ACNode **queue = (ACNode **)malloc(queueCap * sizeof(ACNode*));
-    if (!queue) return root;
-
-    int front = 0, back = 0;
-
-    for (int c = 0; c < AC_ALPHABET_SIZE; c++) {
-        if (root->children[c]) {
-            root->children[c]->fail = root;
-            queue[back++] = root->children[c];
-            if ((size_t)back == queueCap) {
-                queueCap *= 2;
-                ACNode **newQ = (ACNode**)realloc(queue, queueCap*sizeof(ACNode*));
-                if (!newQ) {
-                    free(queue);
-                    return root;
-                }
-                queue = newQ;
-            }
-        } else {
-            root->children[c] = root; // missing => link back to root
-        }
-    }
-
-    while (front < back) {
-        ACNode *u = queue[front++];
-        for (int c = 0; c < AC_ALPHABET_SIZE; c++) {
-            ACNode *v = u->children[c];
-            if (!v) {
-                u->children[c] = u->fail->children[c];
-                continue;
-            }
-            ACNode *f = u->fail;
-            v->fail = f->children[c];
-            v->output |= v->fail->output;
-
-            queue[back++] = v;
-            if ((size_t)back == queueCap) {
-                queueCap *= 2;
-                ACNode **newQ = (ACNode**)realloc(queue, queueCap*sizeof(ACNode*));
-                if (!newQ) {
-                    free(queue);
-                    return root;
-                }
-                queue = newQ;
-            }
-        }
-    }
-
-    free(queue);
-    return root;
+// -----------------------------------------------------------------------------
+//  Ring Buffer Logic
+// -----------------------------------------------------------------------------
+static void ringbuf_init(ACNode *root)
+{
+    pthread_mutex_init(&g_ring.lock, NULL);
+    pthread_mutex_lock(&g_ring.lock);
+    memset(g_ring.buffer, 0, sizeof(g_ring.buffer));
+    g_ring.writePos = 0;
+    g_ring.globalOffset = 0;
+    g_ring.acState = root;
+    pthread_mutex_unlock(&g_ring.lock);
 }
 
-static int examine_frame_header(const unsigned char *ptr, size_t size) {
-    ZSTD_frameHeader fHeader;
-    size_t ret = ZSTD_getFrameHeader(&fHeader, ptr, size);
-    if (ZSTD_isError(ret)) {
-        fprintf(stderr, "Invalid frame header: %s\n", ZSTD_getErrorName(ret));
-        return 0;
-    }
-    
-    // Print frame details
-    fprintf(stderr, "Frame details:\n");
-    fprintf(stderr, "  Window Size: %zu\n", fHeader.windowSize);
-    fprintf(stderr, "  Dict ID: %u\n", fHeader.dictID);
-    fprintf(stderr, "  Content Size: %zu\n", fHeader.frameContentSize);
-    fprintf(stderr, "  Has Checksum: %d\n", fHeader.checksumFlag);
-    
-    return 1;
-}
-
-// Non-recursive free (handles cycles in AC automaton)
-static void free_aho_automaton(ACNode *root) {
-    if (!root) return;
-    size_t queueCap = 1024;
-    ACNode **queue = (ACNode**)malloc(queueCap*sizeof(ACNode*));
-    if (!queue) return;
-
-    size_t visitedCap = 1024;
-    ACNode **visited = (ACNode**)malloc(visitedCap*sizeof(ACNode*));
-    if (!visited) {
-        free(queue);
-        return;
-    }
-    int front = 0, back = 0;
-    size_t visitedCount = 0;
-
-    queue[back++] = root;
-    visited[visitedCount++] = root;
-
-    while (front < back) {
-        ACNode *u = queue[front++];
-        for (int c = 0; c < AC_ALPHABET_SIZE; c++) {
-            ACNode *child = u->children[c];
-            if (!child || child == root) continue;
-            bool alreadyVisited = false;
-            for (size_t i=0; i<visitedCount; i++) {
-                if (visited[i] == child) {
-                    alreadyVisited = true;
-                    break;
-                }
-            }
-            if (!alreadyVisited) {
-                if (back == (int)queueCap) {
-                    queueCap *= 2;
-                    ACNode **newQ = (ACNode**)realloc(queue, queueCap*sizeof(ACNode*));
-                    if (!newQ) goto done;
-                    queue = newQ;
-                }
-                queue[back++] = child;
-
-                if (visitedCount == visitedCap) {
-                    visitedCap *= 2;
-                    ACNode **newV = (ACNode**)realloc(visited, visitedCap*sizeof(ACNode*));
-                    if (!newV) goto done;
-                    visited = newV;
-                }
-                visited[visitedCount++] = child;
-            }
-        }
-    }
-
-done:
-    // free all visited
-    for (size_t i=visitedCount; i>0; i--) {
-        free(visited[i-1]);
-    }
-    free(visited);
-    free(queue);
-}
-
-// -------------------------------------
-// 3) Searching
-// -------------------------------------
-
-// If you want to *immediately* enqueue to the printer, we do so here
 static void ac_feed_chunk(
     ACNode **curStatePtr,
-    const char *data, size_t dataLen,
+    const char *data,
+    size_t dataLen,
     ACNode *root,
     off_t globalOffset,
     const char *filename,
-    PrintQueue *pqueue,        // <--- we push here
+    PrintQueue *pqueue,
     const char *searchStr)
 {
-    if (!curStatePtr || !*curStatePtr || !data || !pqueue || !searchStr) {
-        fprintf(stderr, "Invalid parameters to ac_feed_chunk\n");
+    if (!curStatePtr || !*curStatePtr || !data || !pqueue || !searchStr)
+    {
         return;
     }
+
     ACNode *st = *curStatePtr;
-    for (size_t i=0; i<dataLen; i++) {
+    size_t patLen = get_pattern_len();
+
+    for (size_t i = 0; i < dataLen; i++)
+    {
         unsigned char c = (unsigned char)tolower((unsigned char)data[i]);
         st = st->children[c];
-        if (st->output) {
-            // match end at i
-            size_t matchLen = g_patternLen;
-            size_t matchStart = (i >= matchLen-1) ? (i - (matchLen-1)) : 0;
-
-            size_t snippetStart = (matchStart < 50) ? 0 : (matchStart-50);
-            if (snippetStart > dataLen) snippetStart = dataLen;
-
-            size_t snippetSize = dataLen - snippetStart;
-            if (snippetSize > 250) snippetSize = 250;
-
-            char preview[512];
-            memset(preview, 0, sizeof(preview));
-            memcpy(preview, data + snippetStart, snippetSize);
-            preview[snippetSize] = '\0';
-
+        if (st->output)
+        {
+            // We found a 'match' ending at i
+            size_t matchStart = (i >= patLen - 1) ? (i - (patLen - 1)) : 0;
             off_t matchOffset = globalOffset + matchStart;
+
+            // Let's extract the entire line containing 'i'
+            size_t lineStart = i;
+            while (lineStart > 0 && data[lineStart - 1] != '\n')
+            {
+                lineStart--;
+            }
+
+            size_t lineEnd = i;
+            while (lineEnd < dataLen && data[lineEnd] != '\n')
+            {
+                lineEnd++;
+            }
+
+            // Now [lineStart..lineEnd) is the entire line
+            size_t lineLen = lineEnd - lineStart;
+            if (lineLen > 1023)
+            {
+                // prevent overrun, or pick your own limit
+                lineLen = 1023;
+            }
+
+            char preview[1024];
+            memset(preview, 0, sizeof(preview));
+            memcpy(preview, data + lineStart, lineLen);
+            preview[lineLen] = '\0';
+
+            // Optionally compute closeness again
             int closeness = compute_closeness(data + matchStart, searchStr);
 
             // Build the SearchResult
             SearchResult sr;
-            strncpy(sr.filename, filename, sizeof(sr.filename)-1);
-            sr.filename[sizeof(sr.filename)-1] = '\0';
+            strncpy(sr.filename, filename, sizeof(sr.filename) - 1);
+            sr.filename[sizeof(sr.filename) - 1] = '\0';
+
             sr.offset = matchOffset;
             sr.closenessScore = closeness;
-            strncpy(sr.preview, preview, sizeof(sr.preview)-1);
-            sr.preview[sizeof(sr.preview)-1] = '\0';
 
-            // Immediately enqueue for printing
+            strncpy(sr.preview, preview, sizeof(sr.preview) - 1);
+            sr.preview[sizeof(sr.preview) - 1] = '\0';
+
+            // Push to queue
             printqueue_push(pqueue, &sr);
         }
     }
+
     *curStatePtr = st;
-}
-
-// -------------------------------------
-// For ring buffer streaming
-// -------------------------------------
-typedef struct {
-    char buffer[ROLLING_BUF_SIZE];
-    size_t writePos;
-    off_t globalOffset;
-    ACNode *acState;
-} RingBufState;
-
-static __thread RingBufState g_ring;
-
-static void ringbuf_init(ACNode *root) {
-    memset(g_ring.buffer, 0, ROLLING_BUF_SIZE);
-    g_ring.writePos     = 0;
-    g_ring.globalOffset = 0;
-    g_ring.acState      = root;
 }
 
 static void ringbuf_feed(
     PrintQueue *pqueue,
     const char *filename,
-    ACNode *acRoot,
+    ACNode *root,
     const char *searchStr,
     const char *src, size_t srcLen)
 {
-    size_t srcOffset = 0;
-    size_t overlap = (g_patternLen>0)? (g_patternLen-1): 0;
-    if (overlap >= ROLLING_BUF_SIZE) overlap = 0;
+    size_t srcPos = 0;
+    size_t overlap = (get_pattern_len() > 0) ? (get_pattern_len() - 1) : 0;
+    if (overlap >= ROLLING_BUF_SIZE)
+        overlap = 0;
 
-    while (srcLen>0) {
-        if (g_ring.writePos >= ROLLING_BUF_SIZE) {
-            // feed all to AC
+    while (srcLen > 0)
+    {
+        if (g_ring.writePos >= ROLLING_BUF_SIZE)
+        {
+            // feed entire buffer to AC
             ac_feed_chunk(&g_ring.acState, g_ring.buffer, g_ring.writePos,
-                          acRoot, (g_ring.globalOffset - g_ring.writePos),
+                          root, (g_ring.globalOffset - g_ring.writePos),
                           filename, pqueue, searchStr);
 
             // keep overlap
-            if (overlap>g_ring.writePos) overlap=g_ring.writePos;
-            memmove(g_ring.buffer, g_ring.buffer+(g_ring.writePos-overlap), overlap);
-            g_ring.writePos=overlap;
+            if (overlap > g_ring.writePos)
+                overlap = g_ring.writePos;
+            memmove(g_ring.buffer, g_ring.buffer + (g_ring.writePos - overlap), overlap);
+            g_ring.writePos = overlap;
         }
         size_t space = ROLLING_BUF_SIZE - g_ring.writePos;
-        if (space>srcLen) space=srcLen;
+        if (space > srcLen)
+            space = srcLen;
 
-        memcpy(g_ring.buffer+g_ring.writePos, src+srcOffset, space);
+        memcpy(g_ring.buffer + g_ring.writePos, src + srcPos, space);
         g_ring.writePos += space;
         g_ring.globalOffset += space;
-        srcOffset += space;
         srcLen -= space;
+        srcPos += space;
     }
 }
-
-// flush leftover
 static void ringbuf_flush(
     PrintQueue *pqueue,
     const char *filename,
-    ACNode *acRoot,
+    ACNode *root,
     const char *searchStr)
 {
-    if (g_ring.writePos>0) {
+    if (g_ring.writePos > 0)
+    {
         ac_feed_chunk(&g_ring.acState, g_ring.buffer, g_ring.writePos,
-                      acRoot, (g_ring.globalOffset - g_ring.writePos),
+                      root, (g_ring.globalOffset - g_ring.writePos),
                       filename, pqueue, searchStr);
     }
-    g_ring.writePos=0;
+    g_ring.writePos = 0;
 }
 
-static int is_valid_frame_header(const ZSTD_frameHeader *fHeader) {
-    // Reasonable limits for frame validation
-    const uint64_t MAX_WINDOW_SIZE = 1ULL << 31;    // 2GB max window
-    const uint64_t MAX_CONTENT_SIZE = 1ULL << 40;   // 1TB max content
-    
-    // Print frame details for debugging
-    // fprintf(stderr, "Validating frame:\n");
-    // fprintf(stderr, "  Window Size: %zu\n", fHeader->windowSize);
-    // fprintf(stderr, "  Dict ID: %u\n", fHeader->dictID);
-    // fprintf(stderr, "  Content Size: %zu\n", fHeader->frameContentSize);
-    
-    // Basic sanity checks
-    if (fHeader->windowSize > MAX_WINDOW_SIZE) {
-        fprintf(stderr, "  Rejected: Window size too large\n");
-        return 0;
-    }
-    
-    if (fHeader->frameContentSize != ZSTD_CONTENTSIZE_UNKNOWN && 
-        fHeader->frameContentSize > MAX_CONTENT_SIZE) {
-        fprintf(stderr, "  Rejected: Content size too large\n");
-        return 0;
-    }
-    
-    if (fHeader->dictID != 0) {
-        fprintf(stderr, "  Rejected: Dictionary required\n");
-        return 0;
-    }
-    
-    // fprintf(stderr, "  Frame accepted\n");
-    return 1;
-}
-
-// -------------------------------------
-// Tar / zstd scanning
-// -------------------------------------
-static inline size_t octal_to_size(const char *str, size_t n) {
-    size_t val=0;
-    for (size_t i=0; i<n && str[i]>='0' && str[i]<='7'; i++) {
-        val=(val<<3)+(str[i]-'0');
-    }
-    return val;
-}
-
-static inline int is_end_of_archive(const unsigned char *block) {
-    for (int i=0; i<TAR_BLOCK_SIZE; i++) {
-        if (block[i]!=0) return 0;
-    }
-    return 1;
-}
-
-// The refined find_frame_offsets function
-static void find_frame_offsets(const unsigned char *ptr,
-                             size_t size,
-                             off_t **matches,
-                             size_t *count,
-                             size_t *capacity)
+// -----------------------------------------------------------------------------
+//  Decompress a single chunk from .tar.zst using offsets from .idx.json
+// -----------------------------------------------------------------------------
+static void decompress_and_search_chunk(
+    const char *zstFile,
+    const ChunkInfo *c,
+    PrintQueue *pqueue,
+    ACNode *root,
+    const char *searchStr)
 {
-    // Create a decompression context to get frame sizes
-    ZSTD_DCtx* dctx = ZSTD_createDCtx();
-    if (!dctx) return;
+    FILE *fp = fopen(zstFile, "rb");
+    if (!fp)
+    {
+        fprintf(stderr, "Cannot open zst file: %s\n", zstFile);
+        return;
+    }
+    fseeko(fp, c->compressed_offset, SEEK_SET);
 
-    for (size_t i = 0; i + 4 <= size; i++) {
-        uint32_t val;
-        memcpy(&val, ptr + i, 4);
-        if (val == FRAME_MAGIC) {
-            // fprintf(stderr, "\nFound potential frame at offset %zu\n", i);
-            
-            ZSTD_frameHeader fHeader;
-            size_t headerSize = ZSTD_getFrameHeader(&fHeader, ptr + i, size - i);
-            
-            if (!ZSTD_isError(headerSize) && is_valid_frame_header(&fHeader)) {
-                // Get the total frame size (compressed data + header)
-                size_t frameSize = ZSTD_findFrameCompressedSize(ptr + i, size - i);
-                if (ZSTD_isError(frameSize)) {
-                    fprintf(stderr, "Error getting frame size: %s\n", ZSTD_getErrorName(frameSize));
-                    continue;
-                }
-
-                // Store this valid frame offset
-                if (*count == *capacity) {
-                    size_t newCap = (*capacity == 0) ? 512 : (*capacity * 2);
-                    off_t *newArr = (off_t *)realloc(*matches, newCap * sizeof(off_t));
-                    if (!newArr) {
-                        fprintf(stderr, "Out of memory in find_frame_offsets\n");
-                        ZSTD_freeDCtx(dctx);
-                        return;
-                    }
-                    *matches = newArr;
-                    *capacity = newCap;
-                }
-                (*matches)[(*count)++] = i;
-                
-                // Skip past the ENTIRE frame, not just the header
-                i += frameSize - 1;  // -1 because loop will increment
-                
-                // fprintf(stderr, "Frame accepted, size: %zu bytes\n", frameSize);
-            }
-        }
+    void *cbuf = malloc((size_t)c->compressed_size);
+    if (!cbuf)
+    {
+        fclose(fp);
+        return;
+    }
+    size_t readBytes = fread(cbuf, 1, (size_t)c->compressed_size, fp);
+    fclose(fp);
+    if (readBytes != (size_t)c->compressed_size)
+    {
+        fprintf(stderr, "Read mismatch on chunk %d\n", c->chunk_id);
+        free(cbuf);
+        return;
     }
 
+    ZSTD_DCtx *dctx = ZSTD_createDCtx();
+    if (!dctx)
+    {
+        free(cbuf);
+        return;
+    }
+
+    // approximate uncompressed
+    long long length = c->uncompressed_end - c->uncompressed_start + 1;
+    if (length < 0)
+        length = 0;
+    if (length > (long long)MAX_CHUNK_UNCOMPRESSED)
+        length = MAX_CHUNK_UNCOMPRESSED;
+
+    void *dbuf = malloc((size_t)length);
+    if (!dbuf)
+    {
+        free(cbuf);
+        ZSTD_freeDCtx(dctx);
+        return;
+    }
+
+    size_t dSize = ZSTD_decompressDCtx(dctx, dbuf, (size_t)length, cbuf, (size_t)c->compressed_size);
+    if (!ZSTD_isError(dSize))
+    {
+        // feed ring buffer
+        ringbuf_init(root);
+        ringbuf_feed(pqueue, zstFile, root, searchStr, (const char *)dbuf, dSize);
+        ringbuf_flush(pqueue, zstFile, root, searchStr);
+    }
+    else
+    {
+        fprintf(stderr, "Decompress error chunk %d: %s\n",
+                c->chunk_id, ZSTD_getErrorName(dSize));
+    }
+
+    free(dbuf);
+    free(cbuf);
     ZSTD_freeDCtx(dctx);
 }
 
-// process one zstd frame
-static void index_tar_entries_with_ring(
-    ZSTD_DCtx *dctx,
-    const void *mapped,
-    size_t fileSize,
-    off_t startOffset,
+// -----------------------------------------------------------------------------
+//  Search a single .tar.zst with .idx.json
+// -----------------------------------------------------------------------------
+static void search_indexed_file(
+    const char *zstFile,
+    const char *idxFile,
     PrintQueue *pqueue,
-    ACNode *acRoot,
-    const char *searchStr,
-    const char *topFilename)
+    ACNode *root,
+    const char *searchStr)
 {
-    ZSTD_inBuffer zin;
-    zin.src  = (const char*)mapped + startOffset;
-    zin.size = fileSize - startOffset;
-    zin.pos  = 0;
-
-    char outBuf[ZSTD_CHUNK_SIZE];
-    ringbuf_init(acRoot);
-
-    while(1) {
-        ZSTD_outBuffer zout;
-        zout.dst=outBuf;
-        zout.size=ZSTD_CHUNK_SIZE;
-        zout.pos=0;
-
-        size_t ret = ZSTD_decompressStream(dctx, &zout, &zin);
-        if (ZSTD_isError(ret)) {
-            fprintf(stderr, "ZSTD error: %s\n", ZSTD_getErrorName(ret));
-            break;  // exit the while(1) for THIS offset, keep scanning next offsets
-        }
-        size_t chunkLen=zout.pos;
-        if (chunkLen==0 && ret==0) {
-            // end
-            break;
-        }
-        ringbuf_feed(pqueue, topFilename, acRoot, searchStr, outBuf, chunkLen);
-        if (ret==0) break;
-    }
-    // flush leftover
-    ringbuf_flush(pqueue, topFilename, acRoot, searchStr);
-}
-
-// entire file
-static void build_index(
-    const char *filename,
-    PrintQueue *pqueue,
-    const char *searchStr,
-    ACNode *acRoot)
-{
-    int fd=open(filename,O_RDONLY);
-    if(fd<0) return;
-    struct stat st;
-    if(fstat(fd,&st)!=0 || st.st_size==0) {
-        close(fd); 
+    IndexInfo *info = parse_index_json(idxFile);
+    if (!info)
+    {
+        fprintf(stderr, "Failed to parse index file: %s\n", idxFile);
         return;
     }
-    void *mapped=mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);
-    close(fd);
-    if(mapped==MAP_FAILED) return;
 
-    ZSTD_DCtx *dctx=ZSTD_createDCtx();
-    if(!dctx) {
-        munmap(mapped,st.st_size);
-        return;
+    // for each chunk
+    for (size_t i = 0; i < info->count; i++)
+    {
+        decompress_and_search_chunk(zstFile, &info->chunks[i],
+                                    pqueue, root, searchStr);
     }
-    off_t *matches=NULL;
-    size_t matchCount=0, matchCap=0;
-    find_frame_offsets((const unsigned char*)mapped, (size_t)st.st_size,
-                       &matches,&matchCount,&matchCap);
-    // printf("File %s => found %zu frames\n", filename, matchCount);
 
-
-    for(size_t i=0; i<matchCount; i++) {
-        // fprintf(stderr, "Processing frame %zu at offset %lld\n", 
-        //         i, (long long)matches[i]);
-                
-        size_t initRet = ZSTD_initDStream(dctx);
-        if (ZSTD_isError(initRet)) {
-            fprintf(stderr, "Error initDStream: %s\n", ZSTD_getErrorName(initRet));
-            continue;  // Skip this frame but try the next one
-        }
-        
-        index_tar_entries_with_ring(dctx, mapped, st.st_size,
-                                  matches[i],
-                                  pqueue, acRoot, searchStr,
-                                  filename);
-    }
-    free(matches);
-    ZSTD_freeDCtx(dctx);
-    munmap(mapped,st.st_size);
+    free_index_info(info);
 }
 
-// WorkerArgs
-typedef struct {
+// -----------------------------------------------------------------------------
+//  Threading
+// -----------------------------------------------------------------------------
+typedef struct
+{
     PrintQueue *pqueue;
-    char **files;
+    const char **zstFiles;
+    const char **idxFiles;
     int start;
     int end;
+    ACNode *root;
     const char *searchStr;
-    ACNode *acRoot;
-} WorkerArgs;
+} WorkerArg;
 
-// worker thread
-static void *worker_thread(void *arg) {
-    WorkerArgs *w = (WorkerArgs*)arg;
-    for(int i=w->start; i<w->end; i++) {
-        build_index(w->files[i], w->pqueue, w->searchStr, w->acRoot);
+static void *worker_thread(void *arg)
+{
+    WorkerArg *W = (WorkerArg *)arg;
+    for (int i = W->start; i < W->end; i++)
+    {
+        // search each pair
+        search_indexed_file(W->zstFiles[i], W->idxFiles[i],
+                            W->pqueue, W->root, W->searchStr);
     }
     return NULL;
 }
 
-// -------------------------------------
-// 4) Printer Thread
-// -------------------------------------
+// The printer thread
 static void *printer_thread(void *arg)
 {
-    PrintQueue *q = (PrintQueue*)arg;
+    PrintQueue *q = (PrintQueue *)arg;
     SearchResult sr;
-    // pop until done
-    while(printqueue_pop(q, &sr)) {
-        // Print the result
-        printf("{\"file\":\"%s\", \"offset\":%lld, \"score\":%d, \"preview\":\"%s\"}\n",
-               sr.filename,
-               (long long)sr.offset,
-               sr.closenessScore,
-               sr.preview);
-        fflush(stdout);
+    while (printqueue_pop(q, &sr))
+    {
+        // e.g. you could do a closeness threshold
+        size_t patLen = get_pattern_len();
+        if (sr.closenessScore >= (int)(patLen * 0.6))
+        {
+            printf("{\"file\":\"%s\", \"offset\":%lld, \"score\":%d, \"preview\":\"%s\"}\n",
+                   sr.filename, (long long)sr.offset,
+                   sr.closenessScore,
+                   sr.preview);
+            fflush(stdout);
+        }
     }
     return NULL;
 }
 
-// -------------------------------------
-// main
-// -------------------------------------
-int main(int argc, char** argv)
+// -----------------------------------------------------------------------------
+//  Main
+// -----------------------------------------------------------------------------
+int main(int argc, char **argv)
 {
-    if(argc<2) {
-        fprintf(stderr, "Usage: %s <searchString>\n",argv[0]);
+    if (argc < 2)
+    {
+        fprintf(stderr, "Usage: %s <pattern>\n", argv[0]);
         return 1;
     }
-    const char *searchStr=argv[1];
+    const char *pattern = argv[1];
 
-    // Build the automaton
-    ACNode *acRoot = build_aho_automaton(searchStr);
-    if(!acRoot) {
-        fprintf(stderr, "Failed to build Aho automaton\n");
-        return 1;
-    }
+    // A simple approach: we gather pairs: batch_XXXXX.tar.zst & batch_XXXXX.tar.idx.json
+    // or you can pass them as arguments.
 
-    // Gather files
-    DIR *d=opendir(".");
-    if(!d) {
-        free_aho_automaton(acRoot);
+    // For example, let's scan the current dir for "batch_XXXXX.tar.zst" and see if "batch_XXXXX.tar.idx.json" exists.
+    DIR *d = opendir(".");
+    if (!d)
+    {
+        fprintf(stderr, "Cannot open current dir.\n");
         return 1;
     }
 
-    char **files=NULL;
-    size_t fileCount=0, fileCap=0;
+    char **zstFiles = NULL;
+    char **idxFiles = NULL;
+    size_t capacity = 0, count = 0;
+
     struct dirent *de;
-    while((de=readdir(d))!=NULL) {
-        // Use fnmatch for more flexible pattern matching
-        if(fnmatch("batch_[0-9][0-9][0-9][0-9][0-9].tar.zst", de->d_name, 0) == 0) {
-            if(fileCount==fileCap) {
-                fileCap = fileCap ? fileCap*2 : 32;
-                char **tmp = (char**)realloc(files, fileCap*sizeof(char*));
-                if(!tmp) {
-                    free(files);
-                    closedir(d);
-                    free_aho_automaton(acRoot);
-                    return 1;
+    while ((de = readdir(d)) != NULL)
+    {
+        if (fnmatch("batch_[0-9][0-9][0-9][0-9][0-9].tar.zst", de->d_name, 0) == 0)
+        {
+            // build idx filename
+            char idxName[512];
+            strncpy(idxName, de->d_name, sizeof(idxName));
+            idxName[sizeof(idxName) - 1] = '\0';
+            char *p = strstr(idxName, ".tar.zst");
+            if (!p)
+                continue;
+            strcpy(p, ".tar.idx.json"); // e.g. replace .tar.zst with .tar.idx.json
+
+            struct stat stbuf;
+            if (stat(idxName, &stbuf) == 0)
+            {
+                // we have a pair
+                if (count >= capacity)
+                {
+                    size_t newcap = capacity ? capacity * 2 : 32;
+                    zstFiles = realloc(zstFiles, newcap * sizeof(char *));
+                    idxFiles = realloc(idxFiles, newcap * sizeof(char *));
+                    capacity = newcap;
                 }
-                files = tmp;
+                zstFiles[count] = strdup(de->d_name);
+                idxFiles[count] = strdup(idxName);
+                count++;
             }
-            files[fileCount++] = strdup(de->d_name);
         }
     }
     closedir(d);
 
-    if(fileCount==0) {
-        fprintf(stderr,"No matching .tar.zst files found.\n");
-        free(files);
-        free_aho_automaton(acRoot);
+    if (count == 0)
+    {
+        fprintf(stderr, "No chunked .tar.zst + .idx.json pairs found.\n");
+        free(zstFiles);
+        free(idxFiles);
         return 1;
     }
 
-    // After collecting all files, sort them
-    if(fileCount > 1) {
-        qsort(files, fileCount, sizeof(char*), (int (*)(const void*, const void*))strcmp);
+    // Build Aho automaton
+    init_node_tracker();
+    ACNode *root = build_aho_automaton(pattern);
+    if (!root)
+    {
+        fprintf(stderr, "Cannot build AC automaton\n");
+        return 1;
     }
 
-    printf("Found %zu files to process\n", fileCount);
-    for(size_t i = 0; i < fileCount; i++) {
-        printf("  %zu: %s\n", i+1, files[i]);
-    }
-
-    // 1) Initialize the PrintQueue
-    PrintQueue pqueue;
-    printqueue_init(&pqueue);
-
-    // 2) Launch the printer thread
+    // Prepare printing
+    PrintQueue queue;
+    printqueue_init(&queue);
     pthread_t printerTid;
-    pthread_create(&printerTid, NULL, printer_thread, &pqueue);
+    pthread_create(&printerTid, NULL, printer_thread, &queue);
 
-    // 3) Spawn worker threads to do the searching
-    int threadCount=(fileCount>MAX_THREADS)?MAX_THREADS:(int)fileCount;
+    // Multi-thread
+    int threadCount = (count > MAX_THREADS ? MAX_THREADS : (int)count);
     pthread_t tids[threadCount];
-    WorkerArgs wargs[threadCount];
+    WorkerArg wargs[threadCount];
 
-    int filesPerThread=(int)(fileCount/threadCount);
-    int remainder=(int)(fileCount%threadCount);
-    int start=0;
-    for(int i=0;i<threadCount;i++) {
-        int cnt=filesPerThread+ (i<remainder?1:0);
-        wargs[i].pqueue    = &pqueue;
-        wargs[i].files     = files;
-        wargs[i].start     = start;
-        wargs[i].end       = start+cnt;
-        wargs[i].searchStr = searchStr;
-        wargs[i].acRoot    = acRoot;
-
+    int filesPerThread = count / threadCount;
+    int remainder = count % threadCount;
+    int start = 0;
+    for (int i = 0; i < threadCount; i++)
+    {
+        int load = filesPerThread + (i < remainder ? 1 : 0);
+        wargs[i].pqueue = &queue;
+        wargs[i].zstFiles = (const char **)zstFiles;
+        wargs[i].idxFiles = (const char **)idxFiles;
+        wargs[i].start = start;
+        wargs[i].end = start + load;
+        wargs[i].root = root;
+        wargs[i].searchStr = pattern;
         pthread_create(&tids[i], NULL, worker_thread, &wargs[i]);
-        start+=cnt;
+        start += load;
     }
 
-    // 4) Wait for the worker threads to finish
-    for(int i=0;i<threadCount;i++) {
-        pthread_join(tids[i],NULL);
+    for (int i = 0; i < threadCount; i++)
+    {
+        pthread_join(tids[i], NULL);
     }
 
-    // 5) Mark queue done => signals printer to exit eventually
-    printqueue_mark_done(&pqueue);
-
-    // 6) Wait for printer thread
+    // Done
+    printqueue_mark_done(&queue);
     pthread_join(printerTid, NULL);
 
     // Cleanup
-    for(size_t i=0;i<fileCount;i++) {
-        free(files[i]);
+    for (size_t i = 0; i < count; i++)
+    {
+        free(zstFiles[i]);
+        free(idxFiles[i]);
     }
-    free(files);
+    free(zstFiles);
+    free(idxFiles);
 
-    printqueue_destroy(&pqueue);
-    free_aho_automaton(acRoot);
+    printqueue_destroy(&queue);
+    free_aho_automaton(root);
     return 0;
 }
