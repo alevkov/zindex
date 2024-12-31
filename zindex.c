@@ -16,13 +16,13 @@
 #include "cJSON.h" // The cJSON library header
 
 // For limiting chunk memory usage, etc.
-#define MAX_CHUNK_UNCOMPRESSED (64ULL * 1024ULL * 1024ULL) // e.g. 64MB max
-#define ROLLING_BUF_SIZE (64 * 1024)                       // Use a bigger ring buffer if you want
+#define MAX_CHUNK_UNCOMPRESSED (4ULL * 1024ULL * 1024ULL) // e.g. 64MB max
+#define ROLLING_BUF_SIZE (128 * 1024)                       // Use a bigger ring buffer if you want
 #define MAX_FILENAME_LEN 512
 #define MAX_PREVIEW_LEN 1024
 #define MAX_QUEUE_SIZE 20000
 
-#define MAX_THREADS 8 // or 12, however many you want
+#define MAX_THREADS 12 // or 12, however many you want
 
 // -----------------------------------------------------------------------------
 //  Data structures from your existing code
@@ -153,7 +153,7 @@ static void printqueue_mark_done(PrintQueue *q)
 // -----------------------------------------------------------------------------
 //  Aho-Corasick structures
 // -----------------------------------------------------------------------------
-#define AC_ALPHABET_SIZE 256
+#define AC_ALPHABET_SIZE 512
 
 typedef struct ACNode
 {
@@ -568,70 +568,66 @@ static void decompress_and_search_chunk(
     ACNode *root,
     const char *searchStr)
 {
-    FILE *fp = fopen(zstFile, "rb");
-    if (!fp)
-    {
-        fprintf(stderr, "Cannot open zst file: %s\n", zstFile);
-        return;
-    }
-    fseeko(fp, c->compressed_offset, SEEK_SET);
-
-    void *cbuf = malloc((size_t)c->compressed_size);
-    if (!cbuf)
-    {
-        fclose(fp);
-        return;
-    }
-    size_t readBytes = fread(cbuf, 1, (size_t)c->compressed_size, fp);
-    fclose(fp);
-    if (readBytes != (size_t)c->compressed_size)
-    {
-        fprintf(stderr, "Read mismatch on chunk %d\n", c->chunk_id);
-        free(cbuf);
+    // Memory map the compressed chunk
+    int fd = open(zstFile, O_RDONLY);
+    if (fd < 0) return;
+    
+    void *mapped = mmap(NULL, c->compressed_size, 
+                       PROT_READ, MAP_PRIVATE,
+                       fd, c->compressed_offset);
+    if (mapped == MAP_FAILED) {
+        close(fd);
         return;
     }
 
-    ZSTD_DCtx *dctx = ZSTD_createDCtx();
-    if (!dctx)
-    {
-        free(cbuf);
+    // Create streaming decompression context
+    ZSTD_DStream *dstream = ZSTD_createDStream();
+    if (!dstream) {
+        munmap(mapped, c->compressed_size);
+        close(fd);
         return;
     }
 
-    // approximate uncompressed
-    long long length = c->uncompressed_end - c->uncompressed_start + 1;
-    if (length < 0)
-        length = 0;
-    if (length > (long long)MAX_CHUNK_UNCOMPRESSED)
-        length = MAX_CHUNK_UNCOMPRESSED;
-
-    void *dbuf = malloc((size_t)length);
-    if (!dbuf)
-    {
-        free(cbuf);
-        ZSTD_freeDCtx(dctx);
+    // Use your existing ring buffer, but with streaming decompression
+    char *stream_buf = malloc(ROLLING_BUF_SIZE);
+    if (!stream_buf) {
+        ZSTD_freeDStream(dstream);
+        munmap(mapped, c->compressed_size);
+        close(fd);
         return;
     }
 
-    size_t dSize = ZSTD_decompressDCtx(dctx, dbuf, (size_t)length, cbuf, (size_t)c->compressed_size);
-    if (!ZSTD_isError(dSize))
-    {
-        // feed ring buffer
-        ringbuf_init(root);
-        ringbuf_feed(pqueue, zstFile, root, searchStr, (const char *)dbuf, dSize);
-        ringbuf_flush(pqueue, zstFile, root, searchStr);
-    }
-    else
-    {
-        fprintf(stderr, "Decompress error chunk %d: %s\n",
-                c->chunk_id, ZSTD_getErrorName(dSize));
+    ZSTD_inBuffer input = {
+        .src = mapped,
+        .size = c->compressed_size,
+        .pos = 0
+    };
+
+    ringbuf_init(root);
+
+    while (input.pos < input.size) {
+        ZSTD_outBuffer output = {
+            .dst = stream_buf,
+            .size = ROLLING_BUF_SIZE,
+            .pos = 0
+        };
+
+        size_t ret = ZSTD_decompressStream(dstream, &output, &input);
+        if (ZSTD_isError(ret)) break;
+
+        // Use your existing ring buffer processing
+        ringbuf_feed(pqueue, zstFile, root, searchStr, 
+                    stream_buf, output.pos);
     }
 
-    free(dbuf);
-    free(cbuf);
-    ZSTD_freeDCtx(dctx);
+    ringbuf_flush(pqueue, zstFile, root, searchStr);
+
+    // Cleanup
+    free(stream_buf);
+    ZSTD_freeDStream(dstream);
+    munmap(mapped, c->compressed_size);
+    close(fd);
 }
-
 // -----------------------------------------------------------------------------
 //  Search a single .tar.zst with .idx.json
 // -----------------------------------------------------------------------------
